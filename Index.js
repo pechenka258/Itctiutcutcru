@@ -27,7 +27,7 @@ const Config = {
     },
     GREETINGS: {
         enabled: true,
-        message: "👋 Добро пожаловать, {mention}! Прочитай правила командой /rules.",
+        message: "👋 Добро пожаловать, {mention} в {chat_title}! Вы {count}-й участник. Прочитай правила командой /rules.",
         goodbye_message: "😢 Пользователь {mention} покинул чат."
     },
     CAPTCHA: {
@@ -74,6 +74,44 @@ function escapeHtml(str) {
         .replace(/>/g, "&gt;");
 }
 
+function generateMathProblem() {
+    const a = Math.floor(Math.random() * 10) + 1;
+    const b = Math.floor(Math.random() * 10) + 1;
+    const correct = a + b;
+    const choices = new Set([correct]);
+    while (choices.size < 4) {
+        choices.add(Math.floor(Math.random() * 20) + 1);
+    }
+    const sortedChoices = Array.from(choices).sort(() => Math.random() - 0.5);
+    return {
+        question: `${a} + ${b} = ?`,
+        correct: correct.toString(),
+        choices: sortedChoices.map(String)
+    };
+}
+
+function getProgressBar(xp, reqXp) {
+    const total = 10;
+    const progress = Math.min(Math.floor((xp / reqXp) * total), total);
+    return '▓'.repeat(progress) + '░'.repeat(total - progress);
+}
+
+function getTitleByLevel(level) {
+    if (level >= 20) return "👑 Легенда чата";
+    if (level >= 15) return "⚔️ Гуру общения";
+    if (level >= 10) return "🌟 Знаток";
+    if (level >= 5) return "💬 Активный собеседник";
+    return "🌱 Новичок";
+}
+
+function isNightTime(startHour = 23, endHour = 7) {
+    const hour = new Date().getHours();
+    if (startHour > endHour) {
+        return hour >= startHour || hour < endHour;
+    }
+    return hour >= startHour && hour < endHour;
+}
+
 // ==============================================
 // 3. ХРАНИЛИЩЕ ДАННЫХ
 // ==============================================
@@ -86,7 +124,12 @@ let dbData = {
     config: {
         rules: "📜 Правила чата:\n1. Уважайте друг друга\n2. Не спамьте и не используйте мат\n3. Реклама запрещена",
         badWords: ['скам', 'казино', 'крипта'],
-        allowedDomains: ['github.com', 'google.com', 'youtube.com']
+        allowedDomains: ['github.com', 'google.com', 'youtube.com'],
+        customCommands: {},
+        welcomeMessage: Config.GREETINGS.message,
+        nightMode: { enabled: false, startHour: 23, endHour: 7 },
+        antiRaid: { enabled: true, joinLimit: 5, activeUntil: 0 },
+        scheduledPosts: []
     }
 };
 
@@ -99,6 +142,11 @@ function loadDb() {
             if (!dbData.knownChats) dbData.knownChats = [];
             if (!dbData.chats) dbData.chats = {};
             if (!dbData.config.badWords) dbData.config.badWords = ['скам', 'казино', 'крипта'];
+            if (!dbData.config.customCommands) dbData.config.customCommands = {};
+            if (!dbData.config.welcomeMessage) dbData.config.welcomeMessage = Config.GREETINGS.message;
+            if (!dbData.config.nightMode) dbData.config.nightMode = { enabled: false, startHour: 23, endHour: 7 };
+            if (!dbData.config.antiRaid) dbData.config.antiRaid = { enabled: true, joinLimit: 5, activeUntil: 0 };
+            if (!dbData.config.scheduledPosts) dbData.config.scheduledPosts = [];
             logger.info('База данных успешно загружена.');
         } catch (e) {
             logger.error('Ошибка чтения файла БД:', e);
@@ -128,13 +176,35 @@ function getUser(userId, userName = "Пользователь") {
             mutes: 0,
             bans: 0,
             rankScore: 0,
+            karma: 0,
+            xp: 0,
+            level: 1,
+            karmaGivenToday: 0,
+            lastKarmaReset: getTodayKey(),
             lastReportTime: null,
             mediaStats: { PHOTO: 0, VIDEO: 0, VOICE: 0, STICKER: 0, DOCUMENT: 0, ANIMATION: 0 },
             achievements: []
         };
     }
     dbData.users[userId].name = userName;
+    if (dbData.users[userId].karma === undefined) dbData.users[userId].karma = 0;
+    if (dbData.users[userId].xp === undefined) dbData.users[userId].xp = 0;
+    if (dbData.users[userId].level === undefined) dbData.users[userId].level = 1;
+    if (dbData.users[userId].karmaGivenToday === undefined) dbData.users[userId].karmaGivenToday = 0;
+    if (dbData.users[userId].lastKarmaReset === undefined) dbData.users[userId].lastKarmaReset = getTodayKey();
     return dbData.users[userId];
+}
+
+function addXp(user, amount, ctx) {
+    user.xp += amount;
+    const reqXp = user.level * 50;
+    if (user.xp >= reqXp) {
+        user.level++;
+        user.xp -= reqXp;
+        if (ctx && ctx.reply) {
+            ctx.reply(`🎉 Поздравляем, ${user.name}! Вы достигли ${user.level} уровня! (${getTitleByLevel(user.level)})`);
+        }
+    }
 }
 
 function getChatData(chatId, chatTitle = "Чат") {
@@ -182,7 +252,7 @@ function trackMessage(ctx) {
 function updateRankScore(user) {
     const mediaTotal = Object.values(user.mediaStats).reduce((a, b) => a + b, 0);
     const penalties = (user.warnings + user.bans) * 10;
-    user.rankScore = (user.totalMessages * 1) + (mediaTotal * 2) - penalties;
+    user.rankScore = (user.totalMessages * 1) + (mediaTotal * 2) + (user.karma * 5) - penalties;
 }
 
 function checkAchievements(user, ctx) {
@@ -205,6 +275,8 @@ function checkAchievements(user, ctx) {
 
 const reportSessions = new Map();
 const pendingCaptchas = new Map();
+const activeDuels = new Map();
+const joinTimestamps = [];
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -344,14 +416,23 @@ function containsUnauthorizedLinks(text) {
 }
 
 // ==============================================
-// 7. ТЕКСТ СТАТИСТИКИ
+// 7. ТЕКСТ СТАТИСТИКИ И ПРОФИЛЯ
 // ==============================================
 function buildPersonalStatsText(user) {
     const mediaTotal = Object.values(user.mediaStats).reduce((a, b) => a + b, 0);
     const achievementsCount = user.achievements.length;
+    const reqXp = user.level * 50;
+    const pBar = getProgressBar(user.xp, reqXp);
+    const title = getTitleByLevel(user.level);
 
-    return `📊 Личная статистика пользователя ${user.name}:
+    return `👤 <b>Профиль пользователя: ${escapeHtml(user.name)}</b>
 
+🎖️ <b>Титул:</b> ${title}
+⭐ <b>Уровень:</b> ${user.level}
+📊 <b>Опыт:</b> ${user.xp} / ${reqXp} XP
+<code>[${pBar}]</code>
+
+❤️ <b>Репутация (Карма):</b> ${user.karma}
 💬 Всего сообщений: ${user.totalMessages}
 🔤 Всего символов: ${user.totalChars}
 📷 Отправлено медиа: ${mediaTotal}
@@ -398,7 +479,7 @@ function buildGroupStatsText(chat) {
 // ==============================================
 function getMainMenu() {
     return Markup.inlineKeyboard([
-        [Markup.button.callback("📊 Моя статистика", "menu_my_stats")],
+        [Markup.button.callback("📊 Мой профиль", "menu_my_stats")],
         [Markup.button.callback("📈 Статистика групп", "menu_group_stats")],
         [Markup.button.callback("📋 Активные репорты", "view_reports")]
     ]);
@@ -418,22 +499,18 @@ bot.start(async (ctx) => {
             const welcomeText = 
 `👋 <b>Привет, ${userName}!</b> ${isNewUser ? 'Рад знакомству!' : 'С возвращением!'}
 
-Я — умный <b>бот-модератор</b> и помощник для управления Telegram-группами.
+Я — расширенный <b>бот-модератор</b> и помощник для управления Telegram-группами.
 
-🛡️ <b>Основные возможности:</b>
-• <b>Авто-модерация:</b> Удаление спама, мата и посторонних ссылок.
-• <b>Система варнов:</b> 3 предупреждения ➔ мут на 7 дней, повторные 3 варна ➔ бан.
-• <b>Капча:</b> Проверка новых участников группы при входе.
-• <b>Статистика и Ачивки:</b> Учет сообщений, рейтинг и система достижений.
-• <b>Жалобы (Репорты):</b> Возможность участников репортить нарушения администраторам.
-• <b>Созыв всех (/all):</b> Массовое уведомление участников группы.
+🛡️ <b>Безопасность:</b>
+• Математическая капча, Ночной режим (`/nightmode`), Anti-Raid защита от наплыва ботов.
 
-⚙️ <b>Как начать пользоваться:</b>
-1. Добавьте меня в вашу группу.
-2. Выдайте мне <b>права администратора</b> (удаление сообщений, блокировка участников).
-3. Введите в группе команду <code>/help</code>, чтобы посмотреть весь список доступных команд!
+🎮 <b>Геймификация и Сообщество:</b>
+• Карма/Репутация за "спасибо" или "+1", профиль с уровнями (`/profile`), дуэли (`/duel`).
 
-Используйте кнопки меню ниже для работы с ботом:`;
+⚙️ <b>Автоматизация:</b>
+• Кастомные команды (`/addcmd`), настраиваемое приветствие (`/setwelcome`) и запланированные посты (`/addschedule`).
+
+Используйте `/help` для полного списка команд!`;
 
             return await ctx.replyWithHTML(welcomeText, getMainMenu());
         }
@@ -451,9 +528,10 @@ bot.action('menu_main', async (ctx) => {
 bot.action('menu_my_stats', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const user = getUser(ctx.from.id, ctx.from.first_name);
-    await ctx.editMessageText(buildPersonalStatsText(user), Markup.inlineKeyboard([
-        [Markup.button.callback("⬅️ Назад", "menu_main")]
-    ])).catch(() => {});
+    await ctx.editMessageText(buildPersonalStatsText(user), {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[Markup.button.callback("⬅️ Назад", "menu_main")]])
+    }).catch(() => {});
 });
 
 bot.action('menu_group_stats', async (ctx) => {
@@ -512,79 +590,234 @@ bot.action('view_reports', async (ctx) => {
 });
 
 // ==============================================
-// 9. КОМАНДЫ МОДЕРАЦИИ, ПРАВИЛ, СОЗЫВА И ФИЛЬТРА СЛОВ
+// 9. КОМАНДЫ МОДЕРАЦИИ, КАСТОМИЗАЦИИ И ГЕЙМИФИКАЦИИ
 // ==============================================
 async function handleCallEveryone(ctx) {
-    if (ctx.chat.type === 'private') {
-        return ctx.reply("⚠️ Эта команда работает только в группах!");
-    }
-
-    const userIsAdmin = await isAdmin(ctx, ctx.from.id);
-    if (!userIsAdmin) {
-        return ctx.reply("⛔ Ошибка: Вызывать всех участников могут только администраторы!");
-    }
+    if (ctx.chat.type === 'private') return ctx.reply("⚠️ Эта команда работает только в группах!");
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: Вызывать всех могут только админы!");
 
     const chat = getChatData(ctx.chat.id, ctx.chat.title);
     const userIds = Object.keys(chat.userActivity || {}).filter(id => parseInt(id, 10) !== ctx.from.id);
 
-    if (userIds.length === 0) {
-        return ctx.reply("📢 В базе бота пока нет участников этого чата для созыва.");
-    }
+    if (userIds.length === 0) return ctx.reply("📢 В базе нет участников для созыва.");
 
-    let reasonText = ctx.message.text
-        .replace(/^\/(all|everyone)|^@(all|everyone)/i, '')
-        .trim();
-
+    let reasonText = ctx.message.text.replace(/^\/(all|everyone)|^@(all|everyone)/i, '').trim();
     let header = `📣 <b>СОЗЫВ ВСЕХ УЧАСТНИКОВ!</b>\nОт: ${escapeHtml(ctx.from.first_name)}\n`;
-    if (reasonText) {
-        header += `💬 Сообщение: ${escapeHtml(reasonText)}\n`;
-    }
+    if (reasonText) header += `💬 Сообщение: ${escapeHtml(reasonText)}\n`;
     header += `\n`;
 
-    let mentions = [];
-    userIds.forEach(id => {
-        const u = chat.userActivity[id];
-        mentions.push(`<a href="tg://user?id=${id}">${escapeHtml(u.name)}</a>`);
-    });
+    let mentions = userIds.map(id => `<a href="tg://user?id=${id}">${escapeHtml(chat.userActivity[id].name)}</a>`);
 
     const chunkSize = 30;
     for (let i = 0; i < mentions.length; i += chunkSize) {
         const chunk = mentions.slice(i, i + chunkSize);
-        const messageText = (i === 0 ? header : "") + chunk.join(', ');
-        await ctx.replyWithHTML(messageText).catch(err => {
-            logger.error("Ошибка при отправке упоминаний:", err);
-        });
+        await ctx.replyWithHTML((i === 0 ? header : "") + chunk.join(', ')).catch(err => logger.error("Ошибка упоминания:", err));
     }
 }
 
 bot.command(['all', 'everyone'], handleCallEveryone);
 
-// --- Управление фильтром запрещенных слов ---
-bot.command('addword', async (ctx) => {
-    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав для управления фильтром слов!");
+// --- Геймификация: Профиль и Дуэли ---
+bot.command(['profile', 'me'], (ctx) => {
+    const user = getUser(ctx.from.id, ctx.from.first_name);
+    ctx.replyWithHTML(buildPersonalStatsText(user));
+});
 
+bot.command('duel', async (ctx) => {
+    if (!ctx.message.reply_to_message) {
+        return ctx.reply("⚔️ Ответьте этой командой на сообщение оппонента, чтобы вызвать его на дуэль!");
+    }
+    const opponent = ctx.message.reply_to_message.from;
+    if (opponent.id === ctx.from.id) return ctx.reply("❌ Нельзя вызвать на дуэль самого себя!");
+    if (opponent.is_bot) return ctx.reply("🤖 Боты не участвуют в дуэлях!");
+
+    const challenger = ctx.from;
+    const duelId = `${challenger.id}_${opponent.id}_${Date.now()}`;
+
+    activeDuels.set(duelId, { challenger, opponent });
+
+    return ctx.replyWithHTML(
+        `⚔️ <b>${escapeHtml(challenger.first_name)}</b> вызывает на дуэль <b>${escapeHtml(opponent.first_name)}</b>!\nПобедитель получит +25 XP!`,
+        Markup.inlineKeyboard([
+            [Markup.button.callback("⚔️ Принять вызов", `duel_accept_${duelId}`)],
+            [Markup.button.callback("🏳️ Отклонить", `duel_decline_${duelId}`)]
+        ])
+    );
+});
+
+bot.action(/^duel_accept_(.+)$/, async (ctx) => {
+    const duelId = ctx.match[1];
+    const duel = activeDuels.get(duelId);
+    if (!duel) return ctx.answerCbQuery("Дуэль устарела.");
+
+    if (ctx.from.id !== duel.opponent.id) {
+        return ctx.answerCbQuery("⛔ Вызов брошен не вам!", { show_alert: true });
+    }
+
+    await ctx.answerCbQuery("Вызов принят!");
+    await ctx.editMessageText(`🎲 Дуэль начинается между <b>${escapeHtml(duel.challenger.first_name)}</b> и <b>${escapeHtml(duel.opponent.first_name)}</b>! Бросаем кубики...`, { parse_mode: 'HTML' });
+
+    const msg1 = await ctx.replyWithDice();
+    const msg2 = await ctx.replyWithDice();
+
+    setTimeout(() => {
+        const val1 = msg1.dice.value;
+        const val2 = msg2.dice.value;
+
+        let resultText = `🎲 Результат броска:\n• ${escapeHtml(duel.challenger.first_name)}: <b>${val1}</b>\n• ${escapeHtml(duel.opponent.first_name)}: <b>${val2}</b>\n\n`;
+
+        if (val1 > val2) {
+            const winner = getUser(duel.challenger.id, duel.challenger.first_name);
+            addXp(winner, 25, ctx);
+            resultText += `🏆 Победитель: <b>${escapeHtml(duel.challenger.first_name)}</b> (+25 XP)!`;
+        } else if (val2 > val1) {
+            const winner = getUser(duel.opponent.id, duel.opponent.first_name);
+            addXp(winner, 25, ctx);
+            resultText += `🏆 Победитель: <b>${escapeHtml(duel.opponent.first_name)}</b> (+25 XP)!`;
+        } else {
+            resultText += `🤝 Ничья! Победила дружба!`;
+        }
+
+        saveDb();
+        ctx.replyWithHTML(resultText);
+        activeDuels.delete(duelId);
+    }, 3500);
+});
+
+bot.action(/^duel_decline_(.+)$/, async (ctx) => {
+    const duelId = ctx.match[1];
+    const duel = activeDuels.get(duelId);
+    if (!duel) return ctx.answerCbQuery("Дуэль устарела.");
+
+    if (ctx.from.id !== duel.opponent.id && ctx.from.id !== duel.challenger.id) {
+        return ctx.answerCbQuery("⛔ Вы не участник дуэли!", { show_alert: true });
+    }
+
+    activeDuels.delete(duelId);
+    ctx.editMessageText(`🏳️ Дуэль отклонена.`);
+});
+
+// --- Автоматизация: Триггеры, Приветствия, Объявления, Ночной режим ---
+bot.command('addcmd', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const parts = ctx.message.text.split(' ').slice(1);
+    const trigger = parts[0];
+    const response = parts.slice(1).join(' ').trim();
+
+    if (!trigger || !response) {
+        return ctx.replyWithHTML("⚠️ Формат: <code>/addcmd !триггер Ответный текст или ссылка</code>");
+    }
+
+    const key = (trigger.startsWith('!') || trigger.startsWith('/') ? trigger : `!${trigger}`).toLowerCase();
+    dbData.config.customCommands[key] = response;
+    saveDb();
+    ctx.replyWithHTML(`✅ Кастомная команда <code>${escapeHtml(key)}</code> успешно добавлена!`);
+});
+
+bot.command('delcmd', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const trigger = ctx.message.text.split(' ').slice(1)[0];
+    if (!trigger) return ctx.replyWithHTML("⚠️ Укажите команду: <code>/delcmd !триггер</code>");
+
+    const key = (trigger.startsWith('!') || trigger.startsWith('/') ? trigger : `!${trigger}`).toLowerCase();
+    if (!dbData.config.customCommands[key]) return ctx.reply("⚠️ Команда не найдена.");
+
+    delete dbData.config.customCommands[key];
+    saveDb();
+    ctx.replyWithHTML(`🗑️ Кастомная команда <code>${escapeHtml(key)}</code> удалена!`);
+});
+
+bot.command('customcmds', (ctx) => {
+    const cmds = Object.keys(dbData.config.customCommands || {});
+    if (cmds.length === 0) return ctx.reply("📜 Список кастомных команд пуст.");
+    ctx.replyWithHTML(`⚙️ <b>Кастомные команды (${cmds.length}):</b>\n\n` + cmds.map(c => `• <code>${escapeHtml(c)}</code>`).join('\n'));
+});
+
+bot.command('setwelcome', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const text = ctx.message.text.split(' ').slice(1).join(' ').trim();
+    if (!text) return ctx.replyWithHTML("⚠️ Укажите текст приветствия. Тэги: <code>{mention}</code>, <code>{chat_title}</code>, <code>{count}</code>");
+
+    dbData.config.welcomeMessage = text;
+    saveDb();
+    ctx.reply("✅ Приветственное сообщение обновлено!");
+});
+
+bot.command('nightmode', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const arg = ctx.message.text.split(' ').slice(1)[0];
+    if (arg === 'on') {
+        dbData.config.nightMode.enabled = true;
+        saveDb();
+        return ctx.reply("🌙 Ночной режим ВКЛЮЧЁН (с 23:00 до 07:00 запрет ссылок и медиа).");
+    } else if (arg === 'off') {
+        dbData.config.nightMode.enabled = false;
+        saveDb();
+        return ctx.reply("☀️ Ночной режим ВЫКЛЮЧЁН.");
+    }
+    ctx.reply(`ℹ️ Статус ночного режима: ${dbData.config.nightMode.enabled ? "ВКЛ" : "ВЫКЛ"}\nИспользование: /nightmode on | /nightmode off`);
+});
+
+bot.command('addschedule', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const parts = ctx.message.text.split(' ').slice(1);
+    const minutes = parseInt(parts[0], 10);
+    const text = parts.slice(1).join(' ').trim();
+
+    if (isNaN(minutes) || minutes < 1 || !text) {
+        return ctx.replyWithHTML("⚠️ Формат: <code>/addschedule [минуты] [текст объявления]</code>");
+    }
+
+    const newPost = { id: Date.now().toString(), chatId: ctx.chat.id, intervalMs: minutes * 60 * 1000, lastSent: Date.now(), text };
+    dbData.config.scheduledPosts.push(newPost);
+    saveDb();
+    ctx.replyWithHTML(`⏰ Объявление добавлено! Публикация каждые ${minutes} мин.`);
+});
+
+bot.command('schedules', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const posts = (dbData.config.scheduledPosts || []).filter(p => p.chatId === ctx.chat.id);
+    if (posts.length === 0) return ctx.reply("📋 Запланированных объявлений нет.");
+
+    let text = "📋 <b>Список запланированных объявлений:</b>\n\n";
+    posts.forEach((p, i) => {
+        text += `${i + 1}. ID: <code>${p.id}</code> | Каждые ${Math.round(p.intervalMs / 60000)} мин.\nТекст: ${escapeHtml(p.text.slice(0, 50))}...\n\n`;
+    });
+    ctx.replyWithHTML(text);
+});
+
+bot.command('delschedule', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
+    const id = ctx.message.text.split(' ').slice(1)[0];
+    if (!id) return ctx.replyWithHTML("⚠️ Укажите ID: <code>/delschedule ID</code>");
+
+    dbData.config.scheduledPosts = dbData.config.scheduledPosts.filter(p => p.id !== id);
+    saveDb();
+    ctx.reply("🗑️ Объявление удалено.");
+});
+
+// --- Управление фильтром слов ---
+bot.command('addword', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав!");
     const word = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
-    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово для добавления:\n<code>/addword слово</code>");
+    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово: <code>/addword слово</code>");
 
     if (dbData.config.badWords.includes(word)) {
-        return ctx.replyWithHTML(`⚠️ Слово <code>${escapeHtml(word)}</code> уже есть в списке запрещённых!`);
+        return ctx.replyWithHTML(`⚠️ Слово <code>${escapeHtml(word)}</code> уже есть в фильтре!`);
     }
 
     dbData.config.badWords.push(word);
     saveDb();
-    ctx.replyWithHTML(`✅ Слово <code>${escapeHtml(word)}</code> успешно добавлено в фильтр!`);
+    ctx.replyWithHTML(`✅ Слово <code>${escapeHtml(word)}</code> добавлено в фильтр!`);
 });
 
 bot.command(['delword', 'removeword'], async (ctx) => {
-    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав для управления фильтром слов!");
-
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав!");
     const word = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
-    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово для удаления:\n<code>/delword слово</code>");
+    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово: <code>/delword слово</code>");
 
     const index = dbData.config.badWords.indexOf(word);
-    if (index === -1) {
-        return ctx.replyWithHTML(`⚠️ Слова <code>${escapeHtml(word)}</code> нет в списке запрещённых!`);
-    }
+    if (index === -1) return ctx.replyWithHTML(`⚠️ Слова <code>${escapeHtml(word)}</code> нет в фильтре!`);
 
     dbData.config.badWords.splice(index, 1);
     saveDb();
@@ -592,79 +825,58 @@ bot.command(['delword', 'removeword'], async (ctx) => {
 });
 
 bot.command(['badwords', 'words'], async (ctx) => {
-    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: Только администраторы могут просматривать список слов.");
-
-    if (dbData.config.badWords.length === 0) {
-        return ctx.reply("📜 Список запрещённых слов пуст.");
-    }
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Только админы могут смотреть список слов.");
+    if (dbData.config.badWords.length === 0) return ctx.reply("📜 Список запрещённых слов пуст.");
 
     const wordsList = dbData.config.badWords.map(w => `• <code>${escapeHtml(w)}</code>`).join('\n');
-    ctx.replyWithHTML(`🚫 <b>Список запрещённых слов (${dbData.config.badWords.length}):</b>\n\n${wordsList}`);
+    ctx.replyWithHTML(`🚫 <b>Запрещённые слова (${dbData.config.badWords.length}):</b>\n\n${wordsList}`);
 });
 
 bot.help((ctx) => {
     ctx.reply(
-`📚 Справка по командам и триггерам бота:
+`📚 Справка по командам бота:
 
 👤 Для всех участников:
-• /start — Открыть главное меню в ЛС [Триггер: /start]
-• /help — Показать эту справку [Триггер: /help]
-• /rules — Просмотреть правила чата [Триггер: /rules]
-• /me | /stats — Личная статистика и достижения [Триггеры: /me, /stats]
-• /chatstats | /gstats — Статистика текущей группы [Триггеры: /chatstats, /gstats]
-• /report — Пожаловаться на сообщение [Триггеры: /report, ответ словом «репорт» или «жалоба»]
+• /start — Главное меню в ЛС
+• /help — Показать эту справку
+• /rules — Просмотреть правила чата
+• /profile | /me — Карточка профиля, опыт и карма
+• /duel — Вызов на дуэль (ответом на сообщение)
+• /chatstats | /gstats — Статистика группы
+• /report — Пожаловаться (ответом на сообщение)
 
-⚙️ Управление чатом (для админов):
-• /all <текст> | /everyone <текст> — Позвать всех участников чата [Триггеры: /all, /everyone, @all, @everyone]
-• /setrules <текст> — Установить новые правила чата [Триггер: /setrules]
-• /addword <слово> — Добавить слово в фильтр [Триггер: /addword]
-• /delword <слово> — Удалить слово из фильтра [Триггеры: /delword, /removeword]
-• /words — Посмотреть список запрещённых слов [Триггеры: /words, /badwords]
+⚙️ Управление чатом (Админы):
+• /all <текст> — Позвать всех участник
+• /setwelcome <текст> — Настроить приветствие ({mention}, {chat_title}, {count})
+• /addcmd !cmd <текст> — Добавить триггер-команду
+• /delcmd !cmd | /customcmds — Удалить / список триггеров
+• /nightmode on|off — Управление ночным режимом
+• /addschedule <мин> <текст> — Добавить авто-объявление
+• /schedules | /delschedule <id> — Управление объявлениями
+• /addword <слово> | /delword <слово> | /words — Фильтр слов
 
-🛡️ Модерация (ответом на сообщение нарушителя):
-• /warn — Выдать предупреждение [Триггеры: /warn, ответ словом «варн» или «warn»]
-  └ 3 варна = МУТ на 7 дней, повторные 3 варна = БАН
-• /unwarn — Снять предупреждение [Триггер: /unwarn]
-
-• /mute <время> — Выдать мут [Триггеры: /mute, ответ словами «мут <время>»]
-  └ Варианты и триггеры времени:
-    • Минуты: /mute 10м | /mute 30 мин | мут 10м | мут 30 мин | мут 45 минут
-    • Часы: /mute 1ч | /mute 2 часа | мут 1ч | мут 2 часа | мут 5 часов
-    • Дни: /mute 1д | /mute 1 день | мут 1д | мут 1 день | мут 3д | мут 5 дней | мут 7 дней
-
-• /unmute — Снять мут [Триггер: /unmute]
-• /ban — Забанить пользователя [Триггер: /ban]
-• /kick — Кикнуть пользователя из чата [Триггер: /kick]
-
-💡 Интерактивное меню со статистикой и списком активных репортов доступно по кнопкам в ЛС бота (/start).`
+🛡️ Модерация (ответом на сообщение):
+• /warn | /unwarn — Предупреждение (3 варна = МУТ 7 дней, повторные 3 = БАН)
+• /mute <время> | /unmute — Выдать/снять мут (10м, 2ч, 1д)
+• /ban | /kick — Забанить или кикнуть`
     );
 });
 
 bot.command('rules', (ctx) => ctx.reply(dbData.config.rules));
 
 bot.command('setrules', async (ctx) => {
-    const userIsAdmin = await isAdmin(ctx, ctx.from.id);
-    if (!userIsAdmin) return ctx.reply("⛔ Ошибка: У вас нет прав для изменения правил!");
-
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ У вас нет прав!");
     const newRules = ctx.message.text.split(' ').slice(1).join(' ').trim();
-    if (!newRules) return ctx.reply("⚠️ Укажите текст правил после команды /setrules");
+    if (!newRules) return ctx.reply("⚠️ Укажите текст правил.");
 
     dbData.config.rules = `📜 Правила чата:\n${newRules}`;
     saveDb();
-    ctx.reply("✅ Правила чата успешно обновлены!");
-});
-
-bot.command(['me', 'stats'], (ctx) => {
-    const user = getUser(ctx.from.id, ctx.from.first_name);
-    ctx.reply(buildPersonalStatsText(user));
+    ctx.reply("✅ Правила успешно обновлены!");
 });
 
 bot.command(['chatstats', 'gstats'], (ctx) => {
-    if (ctx.chat.type === 'private') {
-        return ctx.reply("Для просмотра статистики групп используйте меню ЛС бота: /start");
-    }
-    const chat = getChatData(ctx.chat.id, ctx.chat.title);
-    ctx.reply(buildGroupStatsText(chat));
+    if (ctx.chat.type === 'private') return ctx.reply("Статистика доступна в меню /start");
+    ctx.reply(buildGroupStatsText(getChatData(ctx.chat.id, ctx.chat.title)));
 });
 
 // ==============================================
@@ -704,12 +916,10 @@ bot.action(/^rep_reason_(\d+)_(\d+)$/, async (ctx) => {
     const reporterId = parseInt(ctx.match[1], 10);
     const reasonIndex = parseInt(ctx.match[2], 10);
 
-    if (ctx.from.id !== reporterId) {
-        return ctx.answerCbQuery("⛔ Вы не можете взаимодействовать с чужим репортом!", { show_alert: true });
-    }
+    if (ctx.from.id !== reporterId) return ctx.answerCbQuery("⛔ Это не ваш репорт!", { show_alert: true });
 
     const session = reportSessions.get(reporterId);
-    if (!session) return ctx.answerCbQuery("Сессия репорта устарела.");
+    if (!session) return ctx.answerCbQuery("Сессия устарела.");
 
     session.reason = Config.REPORTS.types[reasonIndex];
     await ctx.answerCbQuery();
@@ -724,10 +934,7 @@ bot.action(/^rep_reason_(\d+)_(\d+)$/, async (ctx) => {
 
 bot.action(/^rep_confirm_(\d+)$/, async (ctx) => {
     const reporterId = parseInt(ctx.match[1], 10);
-
-    if (ctx.from.id !== reporterId) {
-        return ctx.answerCbQuery("⛔ Вы не можете взаимодействовать с чужим репортом!", { show_alert: true });
-    }
+    if (ctx.from.id !== reporterId) return ctx.answerCbQuery("⛔ Это не ваш репорт!", { show_alert: true });
 
     const session = reportSessions.get(reporterId);
     if (!session) return ctx.answerCbQuery("Ошибка сессии.");
@@ -762,15 +969,8 @@ bot.action(/^rep_confirm_(\d+)$/, async (ctx) => {
     }
 
     const adminIds = await getChatAdminsList(ctx.telegram, session.chatId);
+    const reportText = `⚠️ Новая жалоба! (${activeReportsForUser.length}/3)\n💬 Чат: ${session.chatTitle}\n👤 От: ${ctx.from.first_name}\n👥 На: ${session.reportedName}\n📌 Причина: ${session.reason}`;
 
-    const reportText =
-`⚠️ Новая жалоба! (Всего репортов: ${activeReportsForUser.length}/3)
-💬 Чат: ${session.chatTitle}
-👤 От: ${ctx.from.first_name} (ID: ${reporterId})
-👥 На: ${session.reportedName} (ID: ${session.reportedId})
-📌 Причина: ${session.reason}`;
-
-    let sentCount = 0;
     for (const adminId of adminIds) {
         try {
             await ctx.telegram.sendMessage(adminId, reportText, Markup.inlineKeyboard([
@@ -783,34 +983,22 @@ bot.action(/^rep_confirm_(\d+)$/, async (ctx) => {
                     Markup.button.callback("❌ Закрыть", `adm_dismiss_${reportObj.id}`)
                 ]
             ]));
-            sentCount++;
         } catch (e) {}
     }
 
-    await ctx.editMessageText(
-        sentCount > 0 
-            ? `✅ Жалоба отправлена! На пользователя получено ${activeReportsForUser.length}/3 репортов.` 
-            : `⚠️ Жалоба сохранена (${activeReportsForUser.length}/3). Администраторы уведомлены.`
-    );
-
+    await ctx.editMessageText(`✅ Жалоба отправлена! На пользователя получено ${activeReportsForUser.length}/3 репортов.`);
     reportSessions.delete(reporterId);
 });
 
 bot.action(/^rep_cancel_(\d+)$/, async (ctx) => {
     const reporterId = parseInt(ctx.match[1], 10);
-
-    if (ctx.from.id !== reporterId) {
-        return ctx.answerCbQuery("⛔ Вы не можете отменить чужой репорт!", { show_alert: true });
-    }
-
-    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from.id !== reporterId) return ctx.answerCbQuery("⛔ Это не ваш репорт!", { show_alert: true });
     reportSessions.delete(reporterId);
     ctx.editMessageText("Отправка репорта отменена.").catch(() => {});
 });
 
 bot.action(/adm_dismiss_(.+)/, async (ctx) => {
-    const repId = ctx.match[1];
-    dbData.reports = dbData.reports.filter(r => r.id !== repId);
+    dbData.reports = dbData.reports.filter(r => r.id !== ctx.match[1]);
     saveDb();
     ctx.answerCbQuery("Репорт закрыт.");
 });
@@ -821,8 +1009,7 @@ bot.action(/adm_(warn|mute|ban)_(\d+)_(-?\d+)_(.+)/, async (ctx) => {
     const targetChatId = parseInt(ctx.match[3]);
     const repId = ctx.match[4];
 
-    const adminCheck = await isAnywhereAdmin(ctx.telegram, ctx.from.id);
-    if (!adminCheck) return ctx.answerCbQuery("⛔ Отказано в доступе!", { show_alert: true });
+    if (!await isAnywhereAdmin(ctx.telegram, ctx.from.id)) return ctx.answerCbQuery("⛔ Отказано в доступе!", { show_alert: true });
 
     const target = getUser(targetId);
 
@@ -846,7 +1033,7 @@ bot.action(/adm_(warn|mute|ban)_(\d+)_(-?\d+)_(.+)/, async (ctx) => {
         saveDb();
         ctx.answerCbQuery("Действие выполнено!");
     } catch (e) {
-        ctx.answerCbQuery("Ошибка выполнения наказания.");
+        ctx.answerCbQuery("Ошибка выполнения.");
     }
 });
 
@@ -910,10 +1097,26 @@ bot.command('kick', async (ctx) => {
 });
 
 // ==============================================
-// 12. КАПЧА ПРИ ВХОДЕ
+// 12. ВХОД УЧАСТНИКОВ, КАПЧА И ANTI-RAID
 // ==============================================
 bot.on('new_chat_members', async (ctx) => {
     if (!Config.GREETINGS.enabled) return;
+
+    // --- Anti-Raid Проверка ---
+    const now = Date.now();
+    joinTimestamps.push(now);
+    while (joinTimestamps.length > 0 && joinTimestamps[0] < now - 10000) {
+        joinTimestamps.shift();
+    }
+
+    if (joinTimestamps.length >= (dbData.config.antiRaid.joinLimit || 5)) {
+        dbData.config.antiRaid.activeUntil = now + (15 * 60 * 1000);
+        saveDb();
+        try {
+            await ctx.setChatPermissions({ can_send_messages: false });
+            await ctx.reply("🚨 <b>ОБНАРУЖЕН РЕЙД!</b> Чат переведён в режим «Только чтение» на 15 минут.", { parse_mode: 'HTML' });
+        } catch (e) {}
+    }
 
     for (const member of ctx.message.new_chat_members) {
         if (member.is_bot && member.id === ctx.botInfo.id) continue;
@@ -921,24 +1124,33 @@ bot.on('new_chat_members', async (ctx) => {
         getUser(member.id, member.first_name);
         saveDb();
 
+        const count = await ctx.getChatMembersCount().catch(() => 0);
         const mention = `<a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>`;
+        
+        let welcomeMsg = (dbData.config.welcomeMessage || Config.GREETINGS.message)
+            .replace(/{mention}/g, mention)
+            .replace(/{chat_title}/g, escapeHtml(ctx.chat.title || "Чат"))
+            .replace(/{count}/g, count);
 
         if (Config.CAPTCHA.enabled) {
             try {
-                await ctx.restrictChatMember(member.id, {
-                    permissions: { can_send_messages: false, can_send_media_messages: false }
-                });
+                await ctx.restrictChatMember(member.id, { permissions: { can_send_messages: false } });
             } catch (err) {}
 
-            const captchaText = `👋 Добро пожаловать, ${mention}!\n\n🤖 Подтвердите, что вы не робот, нажав кнопку ниже в течение 3 минут:`;
-            
-            const captchaMessage = await ctx.replyWithHTML(captchaText, Markup.inlineKeyboard([
-                [Markup.button.callback("🔘 Я не робот", `captcha_pass_${member.id}`)]
-            ])).catch(() => null);
+            const math = generateMathProblem();
+            const sessionKey = `${ctx.chat.id}_${member.id}`;
+
+            const buttons = math.choices.map(choice => 
+                Markup.button.callback(choice, `captcha_ans_${member.id}_${choice}`)
+            );
+
+            const captchaMessage = await ctx.replyWithHTML(
+                `👋 Welcome, ${mention}!\n\n🧩 <b>Капча:</b> Сколько будет <b>${math.question}</b>?\nВыберите правильный ответ в течение 3 минут:`,
+                Markup.inlineKeyboard([buttons])
+            ).catch(() => null);
 
             if (captchaMessage) {
                 const timer = setTimeout(async () => {
-                    const sessionKey = `${ctx.chat.id}_${member.id}`;
                     if (pendingCaptchas.has(sessionKey)) {
                         try {
                             await ctx.telegram.banChatMember(ctx.chat.id, member.id);
@@ -949,35 +1161,45 @@ bot.on('new_chat_members', async (ctx) => {
                     }
                 }, Config.CAPTCHA.timeout_ms);
 
-                pendingCaptchas.set(`${ctx.chat.id}_${member.id}`, { timer });
+                pendingCaptchas.set(sessionKey, { timer, correct: math.correct });
             }
+        } else {
+            ctx.replyWithHTML(welcomeMsg).catch(() => {});
         }
     }
 });
 
-bot.action(/^captcha_pass_(\d+)$/, async (ctx) => {
+bot.action(/^captcha_ans_(\d+)_(.+)$/, async (ctx) => {
     const targetUserId = parseInt(ctx.match[1], 10);
+    const selectedAnswer = ctx.match[2];
+
     if (ctx.from.id !== targetUserId) {
-        return ctx.answerCbQuery("⛔ Эта кнопка не для вас!", { show_alert: true });
+        return ctx.answerCbQuery("⛔ Эта капча не для вас!", { show_alert: true });
     }
 
     const sessionKey = `${ctx.chat.id}_${targetUserId}`;
-    if (pendingCaptchas.has(sessionKey)) {
-        clearTimeout(pendingCaptchas.get(sessionKey).timer);
-        pendingCaptchas.delete(sessionKey);
-    }
+    const session = pendingCaptchas.get(sessionKey);
 
-    try {
-        await ctx.restrictChatMember(targetUserId, {
-            permissions: { can_send_messages: true, can_send_media_messages: true, can_send_other_messages: true }
-        });
-        await ctx.answerCbQuery("✅ Проверка пройдена!");
-        await ctx.editMessageText(`✅ Проверка пройдена! Добро пожаловать, ${ctx.from.first_name}!`);
-    } catch (e) {}
+    if (!session) return ctx.answerCbQuery("Время капчи истекло.");
+
+    if (selectedAnswer === session.correct) {
+        clearTimeout(session.timer);
+        pendingCaptchas.delete(sessionKey);
+
+        try {
+            await ctx.restrictChatMember(targetUserId, {
+                permissions: { can_send_messages: true, can_send_media_messages: true, can_send_other_messages: true }
+            });
+            await ctx.answerCbQuery("✅ Проверка пройдена!");
+            await ctx.editMessageText(`✅ Капча пройдена! Добро пожаловать, ${escapeHtml(ctx.from.first_name)}!`);
+        } catch (e) {}
+    } else {
+        await ctx.answerCbQuery("❌ Неверно! Попробуйте еще раз.", { show_alert: true });
+    }
 });
 
 // ==============================================
-// 13. ОСНОВНОЙ ФИЛЬТР И УЧЕТ СООБЩЕНИЙ
+// 13. ОСНОВНОЙ ФИЛЬТР, РЕПУТАЦИЯ И УЧЕТ СООБЩЕНИЙ
 // ==============================================
 bot.on('text', async (ctx, next) => {
     if (ctx.chat.type === 'private') return next();
@@ -997,8 +1219,53 @@ bot.on('text', async (ctx, next) => {
     user.totalMessages++;
     user.totalChars += text.length;
     user.lastSeen = new Date().toISOString();
+    addXp(user, 2, ctx);
     updateRankScore(user);
     checkAchievements(user, ctx);
+
+    // --- Проверка кастомных команд (триггеров) ---
+    if (dbData.config.customCommands && dbData.config.customCommands[lowerText]) {
+        return ctx.replyWithHTML(dbData.config.customCommands[lowerText]);
+    }
+
+    // --- Проверка Ночного режима ---
+    if (dbData.config.nightMode.enabled && isNightTime(dbData.config.nightMode.startHour, dbData.config.nightMode.endHour)) {
+        if (!userIsAdmin && containsUnauthorizedLinks(text)) {
+            await ctx.deleteMessage().catch(() => {});
+            return ctx.reply(`🌙 Включён ночной режим! Отправка ссылок запрещена до ${dbData.config.nightMode.endHour}:00.`);
+        }
+    }
+
+    // --- Система Кармы (Репутации) ---
+    const karmaTriggers = ['+', '+1', 'спасибо', 'thanks', 'реп', '+rep', 'thx', 'благодарю'];
+    if (ctx.message.reply_to_message && karmaTriggers.includes(lowerText)) {
+        const targetUser = ctx.message.reply_to_message.from;
+
+        if (targetUser.id === userId) {
+            return ctx.reply("❌ Нельзя ставить репутацию самому себе!");
+        }
+        if (targetUser.is_bot) {
+            return ctx.reply("🤖 Ботам репутация не нужна!");
+        }
+
+        const today = getTodayKey();
+        if (user.lastKarmaReset !== today) {
+            user.karmaGivenToday = 0;
+            user.lastKarmaReset = today;
+        }
+
+        if (user.karmaGivenToday >= 5) {
+            return ctx.reply("⚠️ Вы исчерпали лимит оценок репутации на сегодня (максимум 5 в день).");
+        }
+
+        user.karmaGivenToday++;
+        const target = getUser(targetUser.id, targetUser.first_name);
+        target.karma++;
+        addXp(target, 15, ctx);
+        saveDb();
+
+        return ctx.reply(`❤️ ${user.name} повысил(а) репутацию ${target.name}! (Репутация: ${target.karma})`);
+    }
 
     if (lowerText.startsWith('@all') || lowerText.startsWith('@everyone')) {
         await handleCallEveryone(ctx);
@@ -1049,9 +1316,42 @@ bot.on('text', async (ctx, next) => {
     return next();
 });
 
+// Обработка медиафайлов в ночном режиме
+bot.on(['photo', 'video', 'document', 'voice', 'sticker', 'animation'], async (ctx, next) => {
+    if (ctx.chat.type === 'private') return next();
+
+    const userId = ctx.from.id;
+    const userIsAdmin = await isAdmin(ctx, userId);
+
+    if (dbData.config.nightMode.enabled && isNightTime(dbData.config.nightMode.startHour, dbData.config.nightMode.endHour)) {
+        if (!userIsAdmin) {
+            await ctx.deleteMessage().catch(() => {});
+            return;
+        }
+    }
+    return next();
+});
+
 // ==============================================
-// 14. ЗАПУСК И ОБРАБОТКА ОШИБОК
+// 14. ЗАПЛАНИРОВАННЫЕ ПУБЛИКАЦИИ И ЗАПУСК
 // ==============================================
+setInterval(async () => {
+    const now = Date.now();
+    if (!dbData.config.scheduledPosts) return;
+
+    for (const post of dbData.config.scheduledPosts) {
+        if (now - post.lastSent >= post.intervalMs) {
+            post.lastSent = now;
+            saveDb();
+            try {
+                await bot.telegram.sendMessage(post.chatId, `📢 <b>Объявление:</b>\n\n${escapeHtml(post.text)}`, { parse_mode: 'HTML' });
+            } catch (e) {
+                logger.error(`Ошибка отправки запланированного поста в ${post.chatId}:`, e.message);
+            }
+        }
+    }
+}, 30000);
+
 loadDb();
 
 bot.catch((err, ctx) => {
