@@ -397,14 +397,41 @@ function getMainMenu() {
 
 bot.start(async (ctx) => {
     if (ctx.chat.type === 'private') {
-        return ctx.reply(`🤖 Привет! Я бот-модератор. Выберите действие в меню ниже:`, getMainMenu());
+        const userId = ctx.from.id;
+        const userName = ctx.from.first_name || "Пользователь";
+        
+        const isNewUser = !dbData.users[userId];
+        getUser(userId, userName);
+        saveDb();
+
+        const welcomeText = 
+`👋 **Привет, ${userName}!** ${isNewUser ? 'Рад знакомству!' : 'С возвращением!'}
+
+Я — умный **бот-модератор** и помощник для управления Telegram-группами.
+
+🛡️ **Основные возможности:**
+• **Авто-модерация:** Удаление спама, мата и посторонних ссылок.
+• **Система варнов:** 3 предупреждения ➔ мут на 7 дней, повторные 3 варна ➔ бан.
+• **Капча:** Проверка новых участников группы при входе.
+• **Статистика и Ачивки:** Учет сообщений, рейтинг и система достижений.
+• **Жалобы (Репорты):** Возможность участников репортить нарушения администраторам.
+• **Созыв всех (/all):** Массовое уведомление участников группы.
+
+⚙️ **Как начать пользоваться:**
+1. Добавьте меня в вашу группу.
+2. Выдайте мне **права администратора** (удаление сообщений, блокировка участников).
+3. Введите в группе команду `/help`, чтобы посмотреть весь список доступных команд!
+
+Используйте кнопки меню ниже для работы с ботом:`;
+
+        return ctx.replyWithMarkdown(welcomeText, getMainMenu());
     }
     ctx.reply("Бот активен в группе! Для вызова справки отправьте /help.");
 });
 
 bot.action('menu_main', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.editMessageText(`🤖 Выберите действие:`, getMainMenu()).catch(() => {});
+    await ctx.editMessageText(`🤖 Выберите действие из меню:`, getMainMenu()).catch(() => {});
 });
 
 bot.action('menu_my_stats', async (ctx) => {
@@ -490,7 +517,6 @@ async function handleCallEveryone(ctx) {
         return ctx.reply("📢 В базе бота пока нет участников этого чата для созыва.");
     }
 
-    // Извлекаем текст сообщения после команды /all или @all
     let reasonText = ctx.message.text
         .replace(/^\/(all|everyone)|^@(all|everyone)/i, '')
         .trim();
@@ -501,16 +527,13 @@ async function handleCallEveryone(ctx) {
     }
     header += `\n`;
 
-    // Формируем упоминания участников
     let mentions = [];
     userIds.forEach(id => {
         const u = chat.userActivity[id];
-        // Экранируем спецсимволы в имени для корректного отображения Markdown
         const safeName = u.name.replace(/[\[\]\(\)]/g, '');
         mentions.push(`[${safeName}](tg://user?id=${id})`);
     });
 
-    // Отправляем порциями по 30 человек, чтобы Telegram точно обработал PUSH-уведомления
     const chunkSize = 30;
     for (let i = 0; i < mentions.length; i += chunkSize) {
         const chunk = mentions.slice(i, i + chunkSize);
@@ -610,7 +633,7 @@ function startReportSequence(ctx) {
     });
 
     const buttons = Config.REPORTS.types.map((type, i) => [
-        Markup.button.callback(type, `rep_reason_${reporterId}_${i}`)
+        Markup.button.callback(type, `rep_reason_${reporterId}__${i}`)
     ]);
     buttons.push([Markup.button.callback("Отмена", `rep_cancel_${reporterId}`)]);
     ctx.reply("Выберите причину жалобы:", Markup.inlineKeyboard(buttons));
@@ -918,7 +941,6 @@ bot.on('text', async (ctx, next) => {
     updateRankScore(user);
     checkAchievements(user, ctx);
 
-    // Триггер на текстовый созыв всех (@all или @everyone)
     if (lowerText.startsWith('@all') || lowerText.startsWith('@everyone')) {
         await handleCallEveryone(ctx);
         return;
