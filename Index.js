@@ -51,7 +51,7 @@ const DEFAULT_ACHIEVEMENTS = [
 ];
 
 // ==============================================
-// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДАТ
+// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ==============================================
 function getTodayKey() {
     return new Date().toISOString().split('T')[0];
@@ -64,6 +64,14 @@ function getWeekKey() {
     const pastDaysOfYear = (d - firstDayOfYear) / 86400000;
     const weekNum = Math.ceil((pastDaysOfYear + firstDayOfYear.getDay() + 1) / 7);
     return `${year}-W${weekNum}`;
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }
 
 // ==============================================
@@ -90,6 +98,7 @@ function loadDb() {
             if (!dbData.reports) dbData.reports = [];
             if (!dbData.knownChats) dbData.knownChats = [];
             if (!dbData.chats) dbData.chats = {};
+            if (!dbData.config.badWords) dbData.config.badWords = ['скам', 'казино', 'крипта'];
             logger.info('База данных успешно загружена.');
         } catch (e) {
             logger.error('Ошибка чтения файла БД:', e);
@@ -396,37 +405,42 @@ function getMainMenu() {
 }
 
 bot.start(async (ctx) => {
-    if (ctx.chat.type === 'private') {
-        const userId = ctx.from.id;
-        const userName = ctx.from.first_name || "Пользователь";
-        
-        const isNewUser = !dbData.users[userId];
-        getUser(userId, userName);
-        saveDb();
+    try {
+        if (ctx.chat.type === 'private') {
+            const userId = ctx.from.id;
+            const rawName = ctx.from.first_name || "Пользователь";
+            const userName = escapeHtml(rawName);
+            
+            const isNewUser = !dbData.users[userId];
+            getUser(userId, rawName);
+            saveDb();
 
-        const welcomeText = 
-`👋 **Привет, ${userName}!** ${isNewUser ? 'Рад знакомству!' : 'С возвращением!'}
+            const welcomeText = 
+`👋 <b>Привет, ${userName}!</b> ${isNewUser ? 'Рад знакомству!' : 'С возвращением!'}
 
-Я — умный **бот-модератор** и помощник для управления Telegram-группами.
+Я — умный <b>бот-модератор</b> и помощник для управления Telegram-группами.
 
-🛡️ **Основные возможности:**
-• **Авто-модерация:** Удаление спама, мата и посторонних ссылок.
-• **Система варнов:** 3 предупреждения ➔ мут на 7 дней, повторные 3 варна ➔ бан.
-• **Капча:** Проверка новых участников группы при входе.
-• **Статистика и Ачивки:** Учет сообщений, рейтинг и система достижений.
-• **Жалобы (Репорты):** Возможность участников репортить нарушения администраторам.
-• **Созыв всех (/all):** Массовое уведомление участников группы.
+🛡️ <b>Основные возможности:</b>
+• <b>Авто-модерация:</b> Удаление спама, мата и посторонних ссылок.
+• <b>Система варнов:</b> 3 предупреждения ➔ мут на 7 дней, повторные 3 варна ➔ бан.
+• <b>Капча:</b> Проверка новых участников группы при входе.
+• <b>Статистика и Ачивки:</b> Учет сообщений, рейтинг и система достижений.
+• <b>Жалобы (Репорты):</b> Возможность участников репортить нарушения администраторам.
+• <b>Созыв всех (/all):</b> Массовое уведомление участников группы.
 
-⚙️ **Как начать пользоваться:**
+⚙️ <b>Как начать пользоваться:</b>
 1. Добавьте меня в вашу группу.
-2. Выдайте мне **права администратора** (удаление сообщений, блокировка участников).
-3. Введите в группе команду `/help`, чтобы посмотреть весь список доступных команд!
+2. Выдайте мне <b>права администратора</b> (удаление сообщений, блокировка участников).
+3. Введите в группе команду <code>/help</code>, чтобы посмотреть весь список доступных команд!
 
 Используйте кнопки меню ниже для работы с ботом:`;
 
-        return ctx.replyWithMarkdown(welcomeText, getMainMenu());
+            return await ctx.replyWithHTML(welcomeText, getMainMenu());
+        }
+        await ctx.reply("Бот активен в группе! Для вызова справки отправьте /help.");
+    } catch (err) {
+        logger.error("Ошибка при выполнении команды /start:", err);
     }
-    ctx.reply("Бот активен в группе! Для вызова справки отправьте /help.");
 });
 
 bot.action('menu_main', async (ctx) => {
@@ -498,7 +512,7 @@ bot.action('view_reports', async (ctx) => {
 });
 
 // ==============================================
-// 9. КОМАНДЫ МОДЕРАЦИИ, ПРАВИЛ И СОЗЫВА
+// 9. КОМАНДЫ МОДЕРАЦИИ, ПРАВИЛ, СОЗЫВА И ФИЛЬТРА СЛОВ
 // ==============================================
 async function handleCallEveryone(ctx) {
     if (ctx.chat.type === 'private') {
@@ -521,30 +535,72 @@ async function handleCallEveryone(ctx) {
         .replace(/^\/(all|everyone)|^@(all|everyone)/i, '')
         .trim();
 
-    let header = `📣 **СОЗЫВ ВСЕХ УЧАСТНИКОВ!**\nОт: ${ctx.from.first_name}\n`;
+    let header = `📣 <b>СОЗЫВ ВСЕХ УЧАСТНИКОВ!</b>\nОт: ${escapeHtml(ctx.from.first_name)}\n`;
     if (reasonText) {
-        header += `💬 Сообщение: ${reasonText}\n`;
+        header += `💬 Сообщение: ${escapeHtml(reasonText)}\n`;
     }
     header += `\n`;
 
     let mentions = [];
     userIds.forEach(id => {
         const u = chat.userActivity[id];
-        const safeName = u.name.replace(/[\[\]\(\)]/g, '');
-        mentions.push(`[${safeName}](tg://user?id=${id})`);
+        mentions.push(`<a href="tg://user?id=${id}">${escapeHtml(u.name)}</a>`);
     });
 
     const chunkSize = 30;
     for (let i = 0; i < mentions.length; i += chunkSize) {
         const chunk = mentions.slice(i, i + chunkSize);
         const messageText = (i === 0 ? header : "") + chunk.join(', ');
-        await ctx.replyWithMarkdown(messageText).catch(err => {
+        await ctx.replyWithHTML(messageText).catch(err => {
             logger.error("Ошибка при отправке упоминаний:", err);
         });
     }
 }
 
 bot.command(['all', 'everyone'], handleCallEveryone);
+
+// --- Управление фильтром запрещенных слов ---
+bot.command('addword', async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав для управления фильтром слов!");
+
+    const word = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово для добавления:\n<code>/addword слово</code>");
+
+    if (dbData.config.badWords.includes(word)) {
+        return ctx.replyWithHTML(`⚠️ Слово <code>${escapeHtml(word)}</code> уже есть в списке запрещённых!`);
+    }
+
+    dbData.config.badWords.push(word);
+    saveDb();
+    ctx.replyWithHTML(`✅ Слово <code>${escapeHtml(word)}</code> успешно добавлено в фильтр!`);
+});
+
+bot.command(['delword', 'removeword'], async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: У вас нет прав для управления фильтром слов!");
+
+    const word = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+    if (!word) return ctx.replyWithHTML("⚠️ Укажите слово для удаления:\n<code>/delword слово</code>");
+
+    const index = dbData.config.badWords.indexOf(word);
+    if (index === -1) {
+        return ctx.replyWithHTML(`⚠️ Слова <code>${escapeHtml(word)}</code> нет в списке запрещённых!`);
+    }
+
+    dbData.config.badWords.splice(index, 1);
+    saveDb();
+    ctx.replyWithHTML(`🗑️ Слово <code>${escapeHtml(word)}</code> удалено из фильтра!`);
+});
+
+bot.command(['badwords', 'words'], async (ctx) => {
+    if (!await isAdmin(ctx, ctx.from.id)) return ctx.reply("⛔ Ошибка: Только администраторы могут просматривать список слов.");
+
+    if (dbData.config.badWords.length === 0) {
+        return ctx.reply("📜 Список запрещённых слов пуст.");
+    }
+
+    const wordsList = dbData.config.badWords.map(w => `• <code>${escapeHtml(w)}</code>`).join('\n');
+    ctx.replyWithHTML(`🚫 <b>Список запрещённых слов (${dbData.config.badWords.length}):</b>\n\n${wordsList}`);
+});
 
 bot.help((ctx) => {
     ctx.reply(
@@ -561,6 +617,9 @@ bot.help((ctx) => {
 ⚙️ Управление чатом (для админов):
 • /all <текст> | /everyone <текст> — Позвать всех участников чата [Триггеры: /all, /everyone, @all, @everyone]
 • /setrules <текст> — Установить новые правила чата [Триггер: /setrules]
+• /addword <слово> — Добавить слово в фильтр [Триггер: /addword]
+• /delword <слово> — Удалить слово из фильтра [Триггеры: /delword, /removeword]
+• /words — Посмотреть список запрещённых слов [Триггеры: /words, /badwords]
 
 🛡️ Модерация (ответом на сообщение нарушителя):
 • /warn — Выдать предупреждение [Триггеры: /warn, ответ словом «варн» или «warn»]
@@ -862,7 +921,7 @@ bot.on('new_chat_members', async (ctx) => {
         getUser(member.id, member.first_name);
         saveDb();
 
-        const mention = `[${member.first_name}](tg://user?id=${member.id})`;
+        const mention = `<a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>`;
 
         if (Config.CAPTCHA.enabled) {
             try {
@@ -873,7 +932,7 @@ bot.on('new_chat_members', async (ctx) => {
 
             const captchaText = `👋 Добро пожаловать, ${mention}!\n\n🤖 Подтвердите, что вы не робот, нажав кнопку ниже в течение 3 минут:`;
             
-            const captchaMessage = await ctx.replyWithMarkdown(captchaText, Markup.inlineKeyboard([
+            const captchaMessage = await ctx.replyWithHTML(captchaText, Markup.inlineKeyboard([
                 [Markup.button.callback("🔘 Я не робот", `captcha_pass_${member.id}`)]
             ])).catch(() => null);
 
@@ -991,9 +1050,14 @@ bot.on('text', async (ctx, next) => {
 });
 
 // ==============================================
-// 14. ЗАПУСК
+// 14. ЗАПУСК И ОБРАБОТКА ОШИБОК
 // ==============================================
 loadDb();
+
+bot.catch((err, ctx) => {
+    logger.error(`Ошибка при обработке события ${ctx.updateType}:`, err);
+});
+
 bot.launch().then(() => logger.info('Бот запущен и готов к работе!'));
 
 process.once('SIGINT', () => { saveDb(); bot.stop('SIGINT'); });
